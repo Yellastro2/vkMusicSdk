@@ -87,6 +87,40 @@ class VkApiClient(
         "owner_id" to ownerId.toString(), "audio_id" to audioId.toString(),
     ))
 
+    /** Читает все страницы «Моих треков»; отсутствие album_id отделяет коллекцию от плейлистов. */
+    suspend fun getMyTracks(ownerId: Long): List<VkAudio> {
+        val result = mutableListOf<VkAudio>()
+        var offset = 0
+        while (true) {
+            val page: VkAudioPage = json.decodeFromJsonElement(request("audio.get", mapOf(
+                "owner_id" to ownerId.toString(), "offset" to offset.toString(), "count" to "200",
+            )))
+            result.addAll(page.items)
+            offset += page.items.size
+            if (page.items.isEmpty() || offset >= page.count) break
+        }
+        return result.distinctBy { it.fullId }
+    }
+
+    /** Возвращает ID добавленного экземпляра: новый формат vk-audio items либо старый числовой response. */
+    suspend fun addToMyTracks(audio: VkAudio, userId: Long): VkAudio {
+        val response = add(audio)
+        val item = (response as? JsonObject)?.get("items")?.jsonArray?.firstOrNull()?.jsonObject
+        val newId = item?.get("new_audio_id")?.jsonPrimitive?.longOrNull
+            ?: (response as? JsonPrimitive)?.longOrNull
+        val owner = item?.get("new_owner_id")?.jsonPrimitive?.longOrNull ?: userId
+        require(newId != null && newId > 0 && owner == userId) { "VK не подтвердил добавление аудио" }
+        return audio.copy(id = newId, ownerId = owner, accessKey = null)
+    }
+
+    /** Удаляет личный экземпляр и проверяет audio_ids нового формата либо response=1 старого API. */
+    suspend fun removeFromMyTracks(audio: VkAudio) {
+        val response = delete(audio.ownerId, audio.id)
+        val ids = (response as? JsonObject)?.get("audio_ids") as? JsonArray
+        require(ids?.any { it.jsonPrimitive.content == audio.fullId } == true ||
+            (response as? JsonPrimitive)?.intOrNull == 1) { "VK не подтвердил удаление аудио" }
+    }
+
     /** Обходит все страницы плейлистов по примеру vkpymusic. */
     suspend fun getPlaylists(ownerId: Long): List<VkPlaylist> {
         val result = mutableListOf<VkPlaylist>()
@@ -102,15 +136,69 @@ class VkApiClient(
         return result.distinctBy { "${it.ownerId}_${it.id}" }
     }
 
+    /** Определяет владельца текущего токена, не требуя хранения OAuth callback/user_id. */
+    suspend fun getCurrentUserId(): Long = request("users.get").jsonArray.first().jsonObject
+        .getValue("id").jsonPrimitive.long
+
+    /** Загружает актуальную метадату плейлиста, в том числе права и обложку. */
+    suspend fun getPlaylistById(ownerId: Long, playlistId: Long, accessKey: String? = null): VkPlaylist =
+        json.decodeFromJsonElement(request("audio.getPlaylistById", buildMap {
+            put("owner_id", ownerId.toString()); put("playlist_id", playlistId.toString())
+            accessKey?.takeIf(String::isNotBlank)?.let { put("access_key", it) }
+        }))
+
+    /** Создаёт пустой плейлист; VK самостоятельно задаёт его настройки доступности. */
+    suspend fun createPlaylist(ownerId: Long, title: String): VkPlaylist {
+        require(title.trim().isNotEmpty())
+        return json.decodeFromJsonElement(request("audio.createPlaylist", mapOf(
+            "owner_id" to ownerId.toString(), "title" to title.trim(),
+        )))
+    }
+
+    /** Удаляет указанный плейлист, не вызывая удаление его аудиозаписей из фонотеки. */
+    suspend fun deletePlaylist(playlist: VkPlaylist) {
+        requireMutationResult(request("audio.deletePlaylist", mapOf(
+            "owner_id" to playlist.ownerId.toString(), "playlist_id" to playlist.id.toString(),
+        )))
+    }
+
+    /** Добавляет source-id аудио в плейлист; ключ закрытого аудио передаётся вместе с id. */
+    suspend fun addToPlaylist(playlist: VkPlaylist, audio: VkAudio) {
+        requireMutationResult(request("audio.addToPlaylist", mapOf(
+            "owner_id" to playlist.ownerId.toString(), "playlist_id" to playlist.id.toString(),
+            "audio_ids" to audio.requestId,
+        )))
+    }
+
+    /** Удаляет аудио только из состава плейлиста, сохраняя личную коллекцию пользователя. */
+    suspend fun removeFromPlaylist(playlist: VkPlaylist, audio: VkAudio) {
+        requireMutationResult(request("audio.removeFromPlaylist", mapOf(
+            "owner_id" to playlist.ownerId.toString(), "playlist_id" to playlist.id.toString(),
+            "audio_ids" to audio.fullId,
+        )))
+    }
+
+    /** Не считает response=0/null или явный success=0 успешной записью. */
+    private fun requireMutationResult(response: JsonElement) {
+        require(response != JsonNull && (response as? JsonPrimitive)?.content != "0" &&
+            (response as? JsonPrimitive)?.content != "false" &&
+            (response as? JsonObject)?.get("success")?.jsonPrimitive?.content !in listOf("0", "false")) {
+            "VK не подтвердил изменение плейлиста"
+        }
+    }
+
     /** Обходит все страницы аудио выбранного плейлиста, передавая его access_key. */
     suspend fun getPlaylistTracks(playlist: VkPlaylist): List<VkAudio> {
         val result = mutableListOf<VkAudio>()
+        val ownerId = playlist.original?.ownerId ?: playlist.ownerId
+        val playlistId = playlist.original?.playlistId ?: playlist.id
+        val accessKey = playlist.original?.accessKey ?: playlist.accessKey
         var offset = 0
         while (true) {
             val page: VkAudioPage = json.decodeFromJsonElement(request("audio.get", buildMap {
-                put("owner_id", playlist.ownerId.toString()); put("album_id", playlist.id.toString())
+                put("owner_id", ownerId.toString()); put("album_id", playlistId.toString())
                 put("offset", offset.toString()); put("count", "200")
-                playlist.accessKey?.let { put("access_key", it) }
+                accessKey?.let { put("access_key", it) }
             }))
             result.addAll(page.items)
             offset += page.items.size

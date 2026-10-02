@@ -3,7 +3,7 @@ package com.yellastrodev.vkmusicsdk
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
-/** Метадата аудио VK; идентификатор всегда включает owner_id, в том числе отрицательный. */
+/** Метадата аудио VK; source-id включает владельца, release_audio_id сохраняет серверную связь с релизом. */
 @Serializable
 data class VkAudio(
     val id: Long,
@@ -17,6 +17,7 @@ data class VkAudio(
     val thumb: VkThumbnail? = null,
     val album: VkAlbum? = null,
     val like: Boolean = false,
+    @SerialName("release_audio_id") val releaseAudioId: String? = null,
 ) {
     val fullId: String get() = "${ownerId}_$id"
     val requestId: String get() = accessKey?.takeIf(String::isNotBlank)?.let { "${fullId}_$it" } ?: fullId
@@ -50,6 +51,30 @@ data class VkPlaylist(
     @SerialName("owner_id") val ownerId: Long,
     val title: String = "",
     val count: Int = 0,
+    @SerialName("access_key") val accessKey: String? = null,
+    val description: String = "",
+    val photo: VkThumbnail? = null,
+    val thumbs: List<VkThumbnail> = emptyList(),
+    val permissions: VkPlaylistPermissions? = null,
+    val original: VkPlaylistReference? = null,
+) {
+    val fullId: String get() = "${ownerId}_$id"
+    val coverUrl: String? get() = photo?.url ?: thumbs.firstOrNull()?.url
+    /** Разрешает изменение только своего обычного плейлиста с учётом запрета сервера. */
+    fun canEdit(userId: Long?): Boolean = ownerId == userId && original == null && permissions?.edit != false
+    /** Сохранённые чужие подборки в первом сценарии остаются только для чтения. */
+    fun canDelete(userId: Long?): Boolean = ownerId == userId && original == null && permissions?.delete != false
+}
+
+/** Серверные права плейлиста; отсутствие поля не трактуется как явный запрет. */
+@Serializable
+data class VkPlaylistPermissions(val edit: Boolean? = null, val delete: Boolean? = null)
+
+/** Исходный плейлист для сохранённой чужой подборки. */
+@Serializable
+data class VkPlaylistReference(
+    @SerialName("owner_id") val ownerId: Long,
+    @SerialName("playlist_id") val playlistId: Long,
     @SerialName("access_key") val accessKey: String? = null,
 )
 

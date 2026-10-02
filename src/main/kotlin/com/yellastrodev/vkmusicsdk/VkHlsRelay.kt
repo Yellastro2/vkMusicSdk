@@ -2,15 +2,26 @@ package com.yellastrodev.vkmusicsdk
 
 import java.io.Closeable
 import java.io.IOException
+import java.io.File
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URI
 import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.FutureTask
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.atomic.AtomicLong
+import java.io.InterruptedIOException
+import java.net.InetSocketAddress
+import java.net.Proxy
+import okhttp3.EventListener
+import okhttp3.Call
+import okhttp3.Protocol
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -19,7 +30,10 @@ import okhttp3.Request
 
 /**
  * Loopback HLS для JVM/Android: переписывает URI и расшифровывает AES-128 сегменты.
- * JavaFX получает обычный HLS без EXT-X-KEY. Медиа не перекодируется и не сохраняется.
+ * JavaFX получает обычный HLS без EXT-X-KEY. Корни очереди могут получать URL лениво.
+ * Медиа не перекодируется; необязательный кеш сохраняет готовые сегменты, без AES-ключей.
+ * Явная загрузка экспортирует полный локальный bundle, который новый relay открывает без сети.
+ * Параллельные запросы объединяются; сброс попытки отменяет незавершённые HTTP и ожидания.
  * Нюансы sequence-IV, смены ключей и BYTERANGE сверены с vkpymusic/m3u8converter.py.
  */
 class VkHlsRelay internal constructor(
@@ -31,13 +45,23 @@ class VkHlsRelay internal constructor(
     private val workers = Executors.newFixedThreadPool(4) { task ->
         Thread(task, "vk-hls-resource").apply { isDaemon = true }
     }
-    private val http = OkHttpClient.Builder().callTimeout(25, TimeUnit.SECONDS).build()
+    private val http = OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS).callTimeout(8, TimeUnit.SECONDS)
+        .eventListenerFactory { call -> NetworkEvents(call.request().tag(NetworkTrace::class.java)) }.build()
     private val resources = ConcurrentHashMap<String, Resource>()
     private val keys = ConcurrentHashMap<String, ByteArray>()
     private val playlists = ConcurrentHashMap<String, String>()
     private val sockets = ConcurrentHashMap.newKeySet<Socket>()
     @Volatile private var closed = false
     private var reportError: (String) -> Unit = {}
+    private var reportDiagnostic: (String) -> Unit = {}
+    private val requestCounter = AtomicLong()
+    private val generation = AtomicLong()
+    private val requestGeneration = ThreadLocal<Long>()
+    private val pendingLock = Any()
+    private val pending = ConcurrentHashMap<String, FutureTask<ByteArray>>()
+    private val activeCalls = ConcurrentHashMap.newKeySet<Call>()
+    private var audioCache: VkAudioCache? = null
     private val acceptor = Thread({ acceptConnections() }, "vk-hls-accept").apply {
         isDaemon = true
         start()
@@ -50,21 +74,183 @@ class VkHlsRelay internal constructor(
         val range: String? = null,
         val keyUrl: String? = null,
         val iv: ByteArray? = null,
+        val deferred: DeferredAudio? = null,
+        val contentType: String = "video/mp2t",
+        val audioId: String? = null,
+        val cacheKey: String? = null,
+        val localFile: File? = null,
+        val savedAudio: (() -> File?)? = null,
     )
 
+    /** Объединяет HEAD/GET одного открытия; при повторном запуске позже обновляет media URL. */
+    private class DeferredAudio(private val resolver: () -> String, initialUrl: String?) {
+        private var url = initialUrl
+        private var resolvedAt = if (initialUrl == null) 0L else System.nanoTime()
+        /** Резолвер выполняется только на HTTP-worker, без блокирования потока UI. */
+        @Synchronized fun getUrl(): String {
+            val now = System.nanoTime()
+            if (url == null || now - resolvedAt >= TimeUnit.SECONDS.toNanos(30)) {
+                val fresh = resolver()
+                require(URI(fresh).scheme == "https") { "VK должен вернуть HTTPS-ссылку аудио" }
+                url = fresh
+                resolvedAt = now
+            }
+            return requireNotNull(url)
+        }
+    }
+
     /** Регистрирует HTTPS-плейлист с непредсказуемым локальным URL. */
-    fun open(url: String): String {
+    fun open(url: String, audioId: String? = null): String {
         check(!closed)
         require(URI(url).scheme == "https") { "VK должен вернуть HTTPS-ссылку аудио" }
-        return register(Resource(url, playlist = true))
+        return register(Resource(url, playlist = true, audioId = audioId))
+    }
+
+    /** Регистрирует ленивый трек; перед сетью проверяет savedAudio, включая сохранение после создания очереди. */
+    fun openDeferredAudio(isHls: Boolean, initialUrl: String? = null, audioId: String? = null,
+        savedAudio: (() -> File?)? = null, resolver: () -> String): String {
+        check(!closed)
+        initialUrl?.let { require(URI(it).scheme == "https") }
+        return register(Resource("", playlist = isHls,
+            deferred = DeferredAudio(resolver, initialUrl), contentType = "audio/mpeg", audioId = audioId, savedAudio = savedAudio))
+    }
+
+    /** Подключает постоянный кеш до регистрации корней; ошибки диска не прерывают воспроизведение. */
+    fun useAudioCache(cache: VkAudioCache?) { audioCache = cache }
+
+    /** Открывает опубликованный локальный bundle через HTTP для одинакового HLS-поведения Android/JavaFX. */
+    fun openSavedAudio(root: File): String {
+        require(root.isFile && root.length() > 0)
+        return register(Resource("", playlist = root.extension == "m3u8", localFile = root,
+            contentType = if (root.extension == "mp3") "audio/mpeg" else "video/mp2t"))
+    }
+
+    /** Сохраняет конечный HLS-граф с plaintext-сегментами либо прямой файл; URL/ключи на диск не записываются. */
+    fun downloadAudio(url: String, isHls: Boolean, directory: File, audioId: String,
+        onProgress: (Long, Long?) -> Unit = { _, _ -> }): File {
+        require(URI(url).scheme == "https")
+        directory.mkdirs()
+        val saved = mutableMapOf<Resource, File>()
+        var downloaded = 0L
+        onProgress(0, null)
+        /** Обходит также master/rendition; ограничивает глубину и число файлов повреждённого графа. */
+        fun save(resource: Resource, depth: Int): File {
+            require(depth <= 8 && saved.size < 10_000) { "Слишком большой HLS VK" }
+            saved[resource]?.let { return it }
+            val file = File(directory, "resource-${saved.size}.${if (resource.playlist) "m3u8" else if (resource.contentType == "audio/mpeg") "mp3" else "ts"}")
+            saved[resource] = file
+            if (resource.playlist) {
+                val original = fetch(resource).toString(Charsets.UTF_8)
+                require(original.contains("#EXT-X-ENDLIST") || original.contains("#EXT-X-STREAM-INF:") || original.contains("#EXT-X-MEDIA:")) {
+                    "Нельзя сохранить незавершённый HLS VK"
+                }
+                val rewritten = rewrite(resource.url, original, audioId)
+                val local = Regex("http://127\\.0\\.0\\.1:${server.localPort}/[A-Za-z0-9.-]+").replace(rewritten) { match ->
+                    val child = requireNotNull(resources[URI(match.value).path])
+                    save(child, depth + 1).name
+                }
+                require(!Regex("(?i)https?://|#EXT-X-(SESSION-)?KEY:").containsMatchIn(local)) {
+                    "HLS VK содержит неподдерживаемый внешний ресурс"
+                }
+                file.writeText(local, Charsets.UTF_8)
+            } else {
+                val bytes = readMedia(resource)
+                require(bytes.isNotEmpty()) { "Пустое аудио VK" }
+                file.writeBytes(bytes)
+                downloaded += bytes.size
+                onProgress(downloaded, null)
+            }
+            return file
+        }
+        val root = save(Resource(url, playlist = isHls, audioId = audioId, contentType = "audio/mpeg"), 0)
+        require(downloaded > 0)
+        onProgress(downloaded, downloaded)
+        return root
+    }
+
+    /** Переписывает только относительные ссылки внутри сохранённого каталога, не разрешая выход из него. */
+    private fun rewriteSaved(root: File): String {
+        val directory = root.parentFile.canonicalFile
+        /** Превращает имя локального ресурса в непрозрачный HTTP URI. */
+        fun local(path: String): String {
+            require(!path.contains('/') && !path.contains('\\') && !path.contains(':'))
+            val file = File(directory, path).canonicalFile
+            require(file.parentFile == directory && file.isFile)
+            return openSavedAudio(file)
+        }
+        return root.readLines(Charsets.UTF_8).joinToString("\n", postfix = "\n") { line ->
+            if (line.isNotBlank() && !line.startsWith('#')) local(line.trim())
+            else Regex("URI=\"([^\"]+)\"").replace(line) { "URI=\"${local(it.groupValues[1])}\"" }
+        }
     }
 
     /** Настраивает безопасную диагностику до open: передаёт этап/тип ошибки без URL и ключей. */
     fun onError(reporter: (String) -> Unit) { reportError = reporter }
 
+    /** Настраивает подробные события без URL/токенов; отдельно от предупреждений. */
+    fun onDiagnostic(reporter: (String) -> Unit) { reportDiagnostic = reporter }
+
+    /** Передаёт диагностическое событие без влияния ошибки логгера на воспроизведение. */
+    private fun diagnostic(message: String) { runCatching { reportDiagnostic(message) } }
+
+    /** Одна HTTP-загрузка с безопасным числовым id и последним этапом сетевого соединения. */
+    private class NetworkTrace(val id: Long) { @Volatile var phase = "соединение" }
+
+    /** Запоминает последний этап OkHttp, не записывая адреса, заголовки или содержимое запросов. */
+    private class NetworkEvents(private val trace: NetworkTrace?) : EventListener() {
+        /** Отмечает начало разрешения DNS. */
+        override fun dnsStart(call: Call, domainName: String) { trace?.phase = "DNS" }
+        /** Отмечает установку TCP-соединения. */
+        override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) { trace?.phase = "TCP" }
+        /** Отмечает TLS handshake. */
+        override fun secureConnectStart(call: Call) { trace?.phase = "TLS" }
+        /** После соединения ожидает заголовки ответа. */
+        override fun connectEnd(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?) {
+            trace?.phase = "заголовки"
+        }
+        /** Отмечает ожидание ответа, включая повторное использование соединения. */
+        override fun requestHeadersEnd(call: Call, request: Request) { trace?.phase = "заголовки" }
+    }
+
+    /** Отменяет только текущие чтения; зарегистрированная очередь, готовый кеш и offline-bundle сохраняются. */
+    fun cancelPendingRequests() {
+        synchronized(pendingLock) {
+            generation.incrementAndGet()
+            val count = pending.size
+            pending.values.forEach { it.cancel(true) }
+            pending.clear()
+            activeCalls.forEach { it.cancel() }
+            http.dispatcher.cancelAll()
+            sockets.forEach { runCatching { it.close() } }
+            diagnostic("[cancelVkRequests] Чтения VK отменены: ресурсов=$count")
+        }
+    }
+
+    /** Не позволяет обработчику отменённой попытки запустить новую загрузку после сброса. */
+    private fun ensureCurrentRequest() {
+        if (closed || Thread.currentThread().isInterrupted || requestGeneration.get()?.let { it != generation.get() } == true) {
+            throw InterruptedIOException("Чтение VK отменено")
+        }
+    }
+
+    /** Один worker выполняет загрузку, остальные ожидают тот же результат; ошибочный результат не кешируется. */
+    private fun sharedLoad(key: String, loader: () -> ByteArray): ByteArray {
+        val task = FutureTask<ByteArray> { ensureCurrentRequest(); loader() }
+        val existing = synchronized(pendingLock) {
+            ensureCurrentRequest()
+            pending.putIfAbsent(key, task)
+        }
+        val selected = existing ?: task
+        if (existing == null) task.run() else diagnostic("[joinVkResource] Ожидаем уже выполняющееся чтение VK")
+        try { return selected.get() }
+        catch (error: ExecutionException) { throw (error.cause as? Exception ?: IOException("Ошибка чтения VK")) }
+        finally { if (existing == null) pending.remove(key, task) }
+    }
+
     /** Даёт ресурсу непрозрачный адрес; подписанные upstream URL не попадают в плеер. */
     private fun register(resource: Resource): String {
-        val path = "/${UUID.randomUUID()}${if (resource.playlist) ".m3u8" else ".ts"}"
+        check(!closed)
+        val path = "/${UUID.randomUUID()}${if (resource.playlist) ".m3u8" else if (resource.deferred != null) ".mp3" else ".ts"}"
         resources[path] = resource
         return "http://127.0.0.1:${server.localPort}$path"
     }
@@ -74,8 +260,19 @@ class VkHlsRelay internal constructor(
         while (!closed) {
             try {
                 val socket = server.accept()
+                val acceptedAt = System.nanoTime()
+                val acceptedGeneration = generation.get()
                 sockets.add(socket)
-                workers.execute { serve(socket) }
+                try {
+                    workers.execute {
+                        requestGeneration.set(acceptedGeneration)
+                        try { serve(socket, acceptedAt) } finally { requestGeneration.remove() }
+                    }
+                } catch (error: java.util.concurrent.RejectedExecutionException) {
+                    sockets.remove(socket)
+                    socket.close()
+                    throw error
+                }
             } catch (_: IOException) {
                 if (!closed) close()
             } catch (_: java.util.concurrent.RejectedExecutionException) {
@@ -84,8 +281,12 @@ class VkHlsRelay internal constructor(
         }
     }
 
-    /** Обслуживает GET/HEAD, включая range по уже расшифрованному сегменту. */
-    private fun serve(socket: Socket) {
+    /** Обслуживает GET/HEAD и логирует ожидание worker, этап, байты и время с момента принятия соединения. */
+    private fun serve(socket: Socket, acceptedAt: Long) {
+        val requestId = requestCounter.incrementAndGet()
+        val startedAt = acceptedAt
+        diagnostic("[serveVkHls] Запрос $requestId принят worker: ожидание=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - acceptedAt)}мс")
+        var stage = "запрос плеера"
         try {
             socket.use { connection ->
                 connection.soTimeout = 10_000
@@ -108,55 +309,140 @@ class VkHlsRelay internal constructor(
                     return
                 }
                 try {
-                    val bytes = if (resource.playlist) playlists.getOrPut(resource.url) {
-                        rewrite(resource.url, fetch(resource).toString(Charsets.UTF_8))
-                    }.toByteArray(Charsets.UTF_8)
-                    else readMedia(resource)
-                    val range = headers["range"]?.takeIf { !resource.playlist }
+                    ensureCurrentRequest()
+                    stage = "постоянное хранение"
+                    val savedFile = resource.savedAudio?.invoke()
+                    stage = "получение ссылки VK"
+                    diagnostic("[resolveVkAudio] Запрос $requestId: получаем ссылку либо постоянный файл")
+                    val resolved = if (savedFile != null) resource.copy(url = "", deferred = null,
+                        playlist = savedFile.extension == "m3u8", localFile = savedFile)
+                    else resource.deferred?.let { deferred ->
+                        val url = sharedLoad("resolve:${request[1]}") { deferred.getUrl().toByteArray(Charsets.UTF_8) }
+                        resource.copy(url = url.toString(Charsets.UTF_8), deferred = null)
+                    } ?: resource
+                    stage = if (resolved.playlist) "HLS-плейлист" else "аудио/кеш/расшифровка"
+                    diagnostic("[serveVkHls] Запрос $requestId: метод=${request[0]}, ресурс=$stage, локальный=${resolved.localFile != null}")
+                    val identity = "${resolved.audioId}:${resolved.localFile ?: resolved.url}:${resolved.range}:${resolved.keyUrl}:${resolved.iv?.joinToString(",")}"
+                    val bytes = sharedLoad("resource:${resolved.playlist}:$identity") {
+                        if (resolved.playlist) playlists.getOrPut("${resolved.audioId}:${resolved.localFile ?: resolved.url}") {
+                            resolved.localFile?.let(::rewriteSaved)
+                                ?: rewrite(resolved.url, fetch(resolved).toString(Charsets.UTF_8), resolved.audioId)
+                        }.toByteArray(Charsets.UTF_8) else readMedia(resolved)
+                    }
+                    ensureCurrentRequest()
+                    stage = "отдача плееру"
+                    val range = headers["range"]?.takeIf { !resolved.playlist }
                         ?.let { parseClientRange(it, bytes.size) }
                     val content = if (range != null) bytes.copyOfRange(range.first, range.last + 1) else bytes
                     val response = buildString {
                         append(if (range != null) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
-                        append("Content-Type: ${if (resource.playlist) "application/vnd.apple.mpegurl" else "video/mp2t"}\r\n")
+                        append("Content-Type: ${if (resolved.playlist) "application/vnd.apple.mpegurl" else resolved.contentType}\r\n")
                         append("Content-Length: ${content.size}\r\nAccept-Ranges: bytes\r\n")
                         range?.let { append("Content-Range: bytes ${it.first}-${it.last}/${bytes.size}\r\n") }
                         append("Connection: close\r\n\r\n")
                     }
                     output.write(response.toByteArray(Charsets.US_ASCII))
                     if (request[0] == "GET") output.write(content)
+                    diagnostic("[serveVkHls] Запрос $requestId завершён: байт=${content.size}, время=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)}мс")
                 } catch (error: Exception) {
-                    runCatching { reportError("[serveVkHls] Ошибка ресурса VK HLS: ${error.javaClass.simpleName}") }
+                    val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+                    if (closed || requestGeneration.get() != generation.get() || error is InterruptedException ||
+                        (error is java.util.concurrent.CancellationException && error !is kotlinx.coroutines.TimeoutCancellationException)) {
+                        diagnostic("[serveVkHls] Запрос $requestId отменён: этап=$stage, время=${elapsed}мс")
+                    } else runCatching { reportError("[serveVkHls] Запрос $requestId: этап=$stage, время=${elapsed}мс, ошибка=${error.javaClass.simpleName}") }
                     output.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
                 }
             }
-        } catch (_: IOException) {
-            // Плеер может закрыть соединение при seek или смене трека.
+        } catch (error: IOException) {
+            diagnostic("[serveVkHls] Соединение $requestId закрыто: этап=$stage, время=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)}мс, тип=${error.javaClass.simpleName}")
         } finally {
             sockets.remove(socket)
         }
     }
 
-    /** Загружает ресурс; byte range применяется к ciphertext до расшифровки. */
-    private fun fetch(resource: Resource): ByteArray {
+    /** Объединяет одинаковые сетевые чтения; byte range применяется к ciphertext до расшифровки. */
+    private fun fetch(resource: Resource, kind: String = if (resource.playlist) "плейлист" else "аудио"): ByteArray =
+        sharedLoad("network:${resource.url}:${resource.range}") { fetchNetwork(resource, kind) }
+
+    /** Логирует этап/байты: HLS ограничен 8с, полный прямой аудиофайл сохраняет прежний бюджет 25с. */
+    private fun fetchNetwork(resource: Resource, kind: String): ByteArray {
+        ensureCurrentRequest()
         require(URI(resource.url).scheme == "https") { "Неподдерживаемая схема HLS" }
         fetchOverride?.let { return it(resource.url, resource.range) }
-        val request = Request.Builder().url(resource.url).header("User-Agent", VkApiClient.USER_AGENT)
+        val trace = NetworkTrace(requestCounter.incrementAndGet())
+        val startedAt = System.nanoTime()
+        var received = 0L
+        diagnostic("[fetchVkResource] Запрос ${trace.id}: ресурс=$kind, host=${URI(resource.url).host}, диапазон=${resource.range != null}")
+        val request = Request.Builder().url(resource.url).header("User-Agent", VkApiClient.USER_AGENT).tag(NetworkTrace::class.java, trace)
         resource.range?.let { request.header("Range", it) }
-        return http.newCall(request.build()).execute().use { response ->
+        val call = synchronized(pendingLock) {
+            ensureCurrentRequest()
+            http.newCall(request.build()).also {
+                if (!resource.playlist && resource.contentType == "audio/mpeg") it.timeout().timeout(25, TimeUnit.SECONDS)
+                activeCalls.add(it)
+            }
+        }
+        try { return call.execute().use { response ->
+            diagnostic("[fetchVkResource] Запрос ${trace.id}: HTTP=${response.code}, ожидаетсяБайт=${response.body?.contentLength()}, время=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)}мс")
             if (!response.isSuccessful) throw IOException("VK HLS HTTP ${response.code}")
-            val bytes = response.body?.bytes() ?: throw IOException("Пустой сегмент VK")
+            trace.phase = "тело ответа"
+            val body = response.body ?: throw IOException("Пустой сегмент VK")
+            val bytes = body.byteStream().use { input ->
+                val buffer = ByteArray(32 * 1024)
+                val collected = java.io.ByteArrayOutputStream()
+                while (true) {
+                    ensureCurrentRequest()
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    received += count
+                    collected.write(buffer, 0, count)
+                }
+                collected.toByteArray()
+            }
+            require(body.contentLength() < 0 || body.contentLength() == received) { "Неполный ресурс VK" }
+            diagnostic("[fetchVkResource] Запрос ${trace.id} завершён: байт=$received, время=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)}мс")
             if (resource.range != null && response.code != 206) {
                 val range = parseClientRange(resource.range, bytes.size)
                 bytes.copyOfRange(range.first, range.last + 1)
             } else bytes
         }
+        } catch (error: Exception) {
+            if (!closed && requestGeneration.get()?.let { it != generation.get() } != true && !call.isCanceled()) {
+                runCatching { reportError("[fetchVkResource] Запрос ${trace.id}: ресурс=$kind, этап=${trace.phase}, байт=$received, время=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)}мс, ошибка=${error.javaClass.simpleName}") }
+            }
+            throw error
+        } finally { activeCalls.remove(call) }
     }
 
-    /** Расшифровывает AES-CBC с PKCS7; ключи хранятся только в памяти relay. */
+    /** Читает постоянный файл либо кеш, публикуя сетевые байты только после успешной расшифровки. */
     private fun readMedia(resource: Resource): ByteArray {
+        resource.localFile?.let { return it.readBytes() }
+        val cacheKey = resource.cacheKey ?: resource.audioId?.let {
+            digest("vk-audio-v1:$it:direct:${stableUrl(resource.url)}")
+        }
+        if (cacheKey != null) {
+            try {
+                audioCache?.read(cacheKey)?.let { return it }
+            } catch (error: Exception) {
+                reportError("[readMedia] Не удалось прочитать кеш VK: ${error.javaClass.simpleName}")
+            }
+        }
+        val bytes = decodeMedia(resource)
+        if (cacheKey != null && bytes.isNotEmpty()) {
+            try { audioCache?.write(cacheKey, bytes) }
+            catch (error: Exception) {
+                reportError("[readMedia] Не удалось сохранить кеш VK: ${error.javaClass.simpleName}")
+            }
+        }
+        return bytes
+    }
+
+    /** Расшифровывает AES-CBC с PKCS7; ключи остаются только в памяти relay. */
+    private fun decodeMedia(resource: Resource): ByteArray {
         val bytes = fetch(resource)
         val keyUrl = resource.keyUrl ?: return bytes
-        val key = keys.getOrPut(keyUrl) { fetch(Resource(keyUrl)) }
+        val key = keys.getOrPut(keyUrl) { fetch(Resource(keyUrl), "AES-ключ") }
+        diagnostic("[decodeVkMedia] Расшифровываем сегмент: байт=${bytes.size}")
         require(key.size == 16) { "Некорректный ключ VK HLS" }
         val cipher = Cipher.getInstance("AES/CBC/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(requireNotNull(resource.iv)))
@@ -168,8 +454,19 @@ class VkHlsRelay internal constructor(
     }
 
     /** Переписывает master/media playlist; убирает ключи и upstream BYTERANGE после обработки. */
-    internal fun rewrite(base: String, playlist: String): String {
+    internal fun rewrite(base: String, playlist: String, audioId: String? = null): String {
         require(playlist.trimStart().startsWith("#EXTM3U")) { "Некорректный HLS VK" }
+        // Подпись в query меняется; пути, тайминги, IV и раскладка сегментов определяют версию аудио.
+        val layout = playlist.lineSequence().joinToString("\n") { raw ->
+            val line = raw.trim()
+            if (line.isNotBlank() && !line.startsWith('#')) stableUrl(resolve(base, line))
+            else Regex("URI=\"([^\"]+)\"").replace(line) { match ->
+                "URI=\"${stableUrl(resolve(base, match.groupValues[1]))}\""
+            }
+        }
+        val representation = audioId?.takeIf { playlist.lineSequence().any { line -> line.trim() == "#EXT-X-ENDLIST" } }
+            ?.let { digest("vk-audio-v1:$it:${stableUrl(base)}:$layout") }
+        var resourceIndex = 0
         var sequence = 0L
         var keyUrl: String? = null
         var keyIv: ByteArray? = null
@@ -199,19 +496,22 @@ class VkHlsRelay internal constructor(
                         val url = resolve(base, requireNotNull(attrs["URI"]))
                         require(keyUrl == null || keyIv != null) { "Зашифрованный init map требует IV" }
                         val local = register(Resource(url, range = upstreamRange(attrs["BYTERANGE"], url, offsets),
-                            keyUrl = keyUrl, iv = keyIv))
+                            keyUrl = keyUrl, iv = keyIv,
+                            cacheKey = representation?.let { "$it:map:${resourceIndex++}" }))
                         appendLine("#EXT-X-MAP:URI=\"$local\"")
                     }
                     line.startsWith("#EXT-X-STREAM-INF:") -> { nextIsPlaylist = true; appendLine(line) }
                     line.startsWith("#EXT-X-MEDIA:") || line.startsWith("#EXT-X-I-FRAME-STREAM-INF:") -> {
                         appendLine(Regex("URI=\"([^\"]+)\"").replace(line) { match ->
-                            "URI=\"${register(Resource(resolve(base, match.groupValues[1]), playlist = true))}\""
+                            "URI=\"${register(Resource(resolve(base, match.groupValues[1]), playlist = true, audioId = audioId))}\""
                         })
                     }
                     line.isNotBlank() && !line.startsWith('#') -> {
                         val url = resolve(base, line)
                         val iv = if (keyUrl == null) null else keyIv ?: ByteBuffer.allocate(16).putLong(0).putLong(sequence).array()
-                        appendLine(register(Resource(url, nextIsPlaylist, upstreamRange(range, url, offsets), keyUrl, iv)))
+                        appendLine(register(Resource(url, nextIsPlaylist, upstreamRange(range, url, offsets), keyUrl, iv,
+                            audioId = if (nextIsPlaylist) audioId else null,
+                            cacheKey = if (nextIsPlaylist) null else representation?.let { "$it:segment:${resourceIndex++}" })))
                         if (!nextIsPlaylist) sequence++
                         nextIsPlaylist = false
                         range = null
@@ -221,6 +521,21 @@ class VkHlsRelay internal constructor(
             }
         }
     }
+
+    /** Убирает параметры подписи; неизвестные параметры и качество сохраняются, предпочитая безопасный cache miss. */
+    private fun stableUrl(url: String): String {
+        val unsigned = url.substringBefore('#')
+        val query = unsigned.substringAfter('?', "").split('&').filter { parameter ->
+            parameter.isNotEmpty() && parameter.substringBefore('=').lowercase() !in setOf(
+                "extra", "token", "access_token", "signature", "sig", "sign", "expires", "exp", "auth",
+            )
+        }.joinToString("&")
+        return unsigned.substringBefore('?') + if (query.isEmpty()) "" else "?$query"
+    }
+
+    /** Формирует непрозрачную версию кеша без записи исходных URL. */
+    private fun digest(value: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 
     /** Разбирает атрибуты HLS, сохраняя запятые внутри кавычек URI. */
     private fun attributes(line: String): Map<String, String> =
@@ -262,6 +577,7 @@ class VkHlsRelay internal constructor(
     override fun close() {
         if (closed) return
         closed = true
+        cancelPendingRequests()
         server.close()
         sockets.forEach { runCatching { it.close() } }
         workers.shutdownNow()
