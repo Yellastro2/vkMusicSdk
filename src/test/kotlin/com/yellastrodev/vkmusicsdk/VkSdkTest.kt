@@ -7,6 +7,10 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.async
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import java.util.concurrent.TimeUnit
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.*
@@ -15,6 +19,42 @@ import java.net.URLDecoder
 
 /** Проверки ручного OAuth (включая callback без state), API и loopback HLS без аккаунта VK. */
 class VkSdkTest {
+    /** Диагностический запрет API отклоняет вызов до отправки HTTP, без токена в ошибке. */
+    @Test fun disabledApiDoesNotSendRequests() = runBlocking {
+        MockWebServer().use { server ->
+            VkApiClient("test-token", server.url("/method/").toString(), requestsEnabled = false).use { client ->
+                try {
+                    client.request("users.get")
+                    fail("API должен быть отключён")
+                } catch (error: IllegalStateException) {
+                    assertFalse(error.message.orEmpty().contains("test-token"))
+                }
+                assertEquals(0, server.requestCount)
+            }
+        }
+    }
+
+    /** Параллельные вызовы API ждут завершения ответа и минимального интервала между стартами. */
+    @Test fun throttledRequestsAreSequentialAndSpaced() = runBlocking {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setBody("""{"response":1}""").setBodyDelay(500, TimeUnit.MILLISECONDS))
+            server.enqueue(MockResponse().setBody("""{"response":1}"""))
+            server.enqueue(MockResponse().setBody("""{"response":1}"""))
+            VkApiClient("test-token", server.url("/method/").toString(), minRequestIntervalMs = 250).use { client ->
+                coroutineScope {
+                    val calls = List(3) { async(Dispatchers.IO) { client.request("users.get") } }
+                    assertNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+                    // Пока первый ответ ещё передаётся, второй запрос не должен быть отправлен.
+                    assertNull(server.takeRequest(150, TimeUnit.MILLISECONDS))
+                    assertNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+                    assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
+                    assertNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+                    calls.forEach { it.await() }
+                }
+            }
+        }
+    }
+
     /** Автоматический вход требует state; ручной сценарий сохраняет прежнюю совместимость. */
     @Test fun automaticCallbackRequiresStateAndTrustedOrigin() {
         val prefix = "https://oauth.vk.ru/blank.html#access_token=synthetic-token"
@@ -89,7 +129,7 @@ class VkSdkTest {
         }
     }
 
-    /** Поиск сохраняет отрицательный owner_id, неизвестные поля и m3u8 URL. Токен идёт в POST. */
+    /** Поиск сохраняет метадату, передаёт токен в POST и использует 5.199 без UA VK Android. */
     @Test fun searchPreservesIdentityAndTokenStaysOutOfUrl() = runBlocking {
         MockWebServer().use { server ->
             server.enqueue(MockResponse().setBody("""{"response":{"count":1,"items":[{"id":12,"owner_id":-42,"artist":"Артист","title":"Трек","url":"https://media.example/a.m3u8","unknown":true}]}}"""))
@@ -100,7 +140,10 @@ class VkSdkTest {
                 val request = server.takeRequest()
                 assertEquals("/method/audio.search", request.path)
                 assertEquals("POST", request.method)
-                assertTrue(request.body.readUtf8().contains("access_token=test-token"))
+                val body = request.body.readUtf8()
+                assertTrue(body.contains("access_token=test-token"))
+                assertTrue(body.contains("v=5.199"))
+                assertFalse(request.getHeader("User-Agent").orEmpty().contains("VKAndroidApp"))
             }
         }
     }

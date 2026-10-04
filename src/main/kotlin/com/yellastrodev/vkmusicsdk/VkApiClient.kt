@@ -4,11 +4,17 @@ import java.io.Closeable
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.Cookie
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,36 +22,133 @@ import okhttp3.Response
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-/** Независимый token-based порт транспорта vk-audio; cookies и автоматического web-refresh нет. */
+/** OAuth или браузерный API: web-refresh по необходимости, последовательный тротлинг и диагностический запрет HTTP. */
 class VkApiClient(
     private val accessToken: String,
-    private val apiBase: String = "https://api.vk.ru/method/",
-    private val version: String = "5.282",
+    private val apiBase: String = "https://api.vk.com/method/",
+    private val version: String = "5.199",
+    private val minRequestIntervalMs: Long = 0,
+    private val requestsEnabled: Boolean = true,
+    webSession: VkWebSession? = null,
+    private val onWebSessionUpdated: (VkWebSession) -> Unit = {},
+    private val webTokenUrl: String = "https://login.vk.ru/?act=web_token",
 ) : Closeable {
-    private val http = OkHttpClient.Builder().callTimeout(30, TimeUnit.SECONDS).build()
+    private val http = OkHttpClient.Builder().callTimeout(30, TimeUnit.SECONDS)
+        .followRedirects(webSession == null).followSslRedirects(webSession == null).build()
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
+    private val requestMutex = Mutex()
+    private var lastRequestStartedNanos: Long? = null
+    @Volatile private var currentWebSession = webSession
 
-    init { require(accessToken.isNotBlank()) { "Нужен токен VK" } }
+    /** Последний снимок для защищённого сохранения; OAuth-клиент возвращает null. */
+    val webSession: VkWebSession? get() = currentWebSession
 
-    /** Выполняет POST и возвращает response; отмена coroutine отменяет HTTP-запрос. */
+    init {
+        require(accessToken.isNotBlank() || webSession != null) { "Нужен токен VK" }
+        require(minRequestIntervalMs >= 0) { "Интервал запросов VK не может быть отрицательным" }
+    }
+
+    /** Блокирует API в диагностическом режиме; иначе опционально ограничивает частоту и параллелизм. */
     suspend fun request(method: String, parameters: Map<String, String> = emptyMap()): JsonElement =
         withContext(Dispatchers.IO) {
-            require(method.matches(Regex("[a-zA-Z]+\\.[a-zA-Z]+")))
-            val body = FormBody.Builder().apply {
-                parameters.forEach { (key, value) -> add(key, value) }
-                add("access_token", accessToken)
-                add("v", version)
-                add("lang", "ru")
-            }.build()
-            val call = http.newCall(Request.Builder().url("$apiBase$method")
-                .header("User-Agent", USER_AGENT).post(body).build())
-            val text = call.awaitText()
-            val root = json.parseToJsonElement(text).jsonObject
-            root["error"]?.jsonObject?.let { error ->
-                throw VkApiException(error["error_code"]?.jsonPrimitive?.intOrNull ?: -1)
+            check(requestsEnabled) { "Запросы VK API отключены для диагностики авторизации" }
+            if (minRequestIntervalMs == 0L && currentWebSession == null) return@withContext executeRequest(method, parameters)
+            requestMutex.withLock {
+                refreshWebToken(force = false)
+                try {
+                    executeRequest(method, parameters)
+                } catch (error: VkApiException) {
+                    if (error.code != 5 || currentWebSession == null) throw error
+                    refreshWebToken(force = true)
+                    executeRequest(method, parameters)
+                }
             }
-            root["response"] ?: throw IOException("VK вернул ответ без response")
         }
+
+    /** Получает первый веб-токен без вызовов музыкального API; повторный вход не запускает фоновых таймеров. */
+    suspend fun authenticateWebSession(): VkWebSession = withContext(Dispatchers.IO) {
+        check(requestsEnabled) { "Запросы VK API отключены для диагностики авторизации" }
+        requestMutex.withLock {
+            check(currentWebSession != null) { "Браузерная сессия VK отсутствует" }
+            refreshWebToken(force = false)
+            checkNotNull(currentWebSession)
+        }
+    }
+
+    /** Ограничивает старты как web_token, так и API одним общим интервалом; ошибки тоже учитываются. */
+    private suspend fun awaitRequestTurn() {
+        if (minRequestIntervalMs > 0) lastRequestStartedNanos?.let { previous ->
+            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - previous)
+            val remainingMs = minRequestIntervalMs - elapsedMs
+            if (remainingMs > 0) delay(remainingMs)
+        }
+        currentCoroutineContext().ensureActive()
+        if (minRequestIntervalMs > 0) lastRequestStartedNanos = System.nanoTime()
+    }
+
+    /** Обновляет истекающий токен через cookies, сохраняет ротацию до публикации нового снимка. */
+    private suspend fun refreshWebToken(force: Boolean) {
+        val session = currentWebSession ?: return
+        if (!force && session.accessToken.isNotBlank() && session.expiresAt - System.currentTimeMillis() / 1_000 > 600) return
+        awaitRequestTurn()
+        val request = Request.Builder().url(webTokenUrl)
+            .header("User-Agent", session.userAgent)
+            .header("Origin", "https://vk.ru").header("Referer", "https://vk.ru/")
+            .header("Cookie", "p=${session.p}; remixsid=${session.remixsid}")
+            .post(FormBody.Builder().add("version", "1").add("app_id", "6287487").build()).build()
+        val (text, cookies) = http.newCall(request).awaitResponse { response ->
+            if (response.code == 401 || response.code == 403) throw VkApiException(5)
+            if (!response.isSuccessful) throw IOException("VK HTTP ${response.code}")
+            (response.body?.string() ?: throw IOException("Пустой ответ VK")) to
+                Cookie.parseAll(response.request.url, response.headers)
+        }
+        val root = try { json.parseToJsonElement(text).jsonObject }
+            catch (_: Exception) { throw IOException("Некорректный ответ авторизации VK") }
+        if (root["type"]?.jsonPrimitive?.contentOrNull == "error") {
+            val code = root["error_code"]?.jsonPrimitive?.intOrNull
+            val unauthorized = root["error_info"]?.jsonPrimitive?.contentOrNull == "unauthorized"
+            if (unauthorized || code == 5) throw VkApiException(5)
+            throw IOException("VK отклонил обновление веб-токена")
+        }
+        val updated = try {
+            check(root["type"]?.jsonPrimitive?.contentOrNull == "okay")
+            val data = root.getValue("data").jsonObject
+            val token = data.getValue("access_token").jsonPrimitive.content
+            val expires = data.getValue("expires").jsonPrimitive.long
+            check(token.isNotBlank() && expires > System.currentTimeMillis() / 1_000)
+            VkWebSession(
+                p = cookies.lastOrNull { it.name == "p" }?.value ?: session.p,
+                remixsid = cookies.lastOrNull { it.name == "remixsid" }?.value ?: session.remixsid,
+                userAgent = session.userAgent, accessToken = token, expiresAt = expires,
+                userId = data["user_id"]?.jsonPrimitive?.longOrNull ?: session.userId,
+            )
+        } catch (_: Exception) { throw IOException("Неполный ответ авторизации VK") }
+        if (session.userId != null && updated.userId != session.userId) throw VkApiException(5)
+        onWebSessionUpdated(updated)
+        currentWebSession = updated
+    }
+
+    /** Отправляет токен в теле POST; ожидание ответа и HTTP отменяются вместе с coroutine. */
+    private suspend fun executeRequest(method: String, parameters: Map<String, String>): JsonElement {
+        require(method.matches(Regex("[a-zA-Z]+\\.[a-zA-Z]+")))
+        awaitRequestTurn()
+        val body = FormBody.Builder().apply {
+            parameters.forEach { (key, value) -> add(key, value) }
+            add("access_token", currentWebSession?.accessToken ?: accessToken)
+            add("v", version)
+            add("lang", "ru")
+            if (currentWebSession != null) add("client_id", "6287487")
+        }.build()
+        val call = http.newCall(Request.Builder().url("$apiBase$method")
+            .apply { currentWebSession?.let { header("User-Agent", it.userAgent) } }
+            .post(body).build())
+        val text = call.awaitText()
+        val root = json.parseToJsonElement(text).jsonObject
+        root["error"]?.jsonObject?.let { error ->
+            throw VkApiException(error["error_code"]?.jsonPrimitive?.intOrNull ?: -1)
+        }
+        return root["response"] ?: throw IOException("VK вернул ответ без response")
+    }
 
     /** Ищет аудио по механике rawSearchAudio из vk-audio. */
     suspend fun search(query: String, offset: Int = 0, count: Int = 50): VkAudioPage =
@@ -222,25 +325,31 @@ class VkApiClient(
     }
 
     companion object {
+        /** Прежний UA только для медиаресурсов relay; API-запросы его не используют. */
         const val USER_AGENT = "VKAndroidApp/4.13.1-1206 (Android 4.4.3; SDK 19; armeabi; ; ru)"
     }
 }
 
 /** Асинхронно читает тело ответа, сохраняя отмену запроса и безопасные ошибки. */
-internal suspend fun Call.awaitText(): String = suspendCancellableCoroutine { continuation ->
+internal suspend fun Call.awaitText(): String = awaitResponse { response ->
+    if (!response.isSuccessful) throw IOException("VK HTTP ${response.code}")
+    response.body?.string() ?: throw IOException("Пустой ответ VK")
+}
+
+/** Обрабатывает закрываемый HTTP-ответ без потери отмены и без URL в сетевой ошибке. */
+internal suspend fun <T> Call.awaitResponse(read: (Response) -> T): T = suspendCancellableCoroutine { continuation ->
     continuation.invokeOnCancellation { cancel() }
     enqueue(object : Callback {
         /** Возвращает сетевую ошибку без URL, который может содержать приватные параметры. */
         override fun onFailure(call: Call, error: IOException) {
             if (continuation.isActive) continuation.resumeWithException(IOException("Не удалось связаться с VK"))
         }
-        /** Закрывает response и передаёт только успешное тело. */
+        /** Закрывает response после обработки и передаёт результат либо безопасную ошибку. */
         override fun onResponse(call: Call, response: Response) {
             response.use {
                 try {
-                    if (!it.isSuccessful) throw IOException("VK HTTP ${it.code}")
-                    val text = it.body?.string() ?: throw IOException("Пустой ответ VK")
-                    if (continuation.isActive) continuation.resume(text)
+                    val value = read(it)
+                    if (continuation.isActive) continuation.resume(value)
                 } catch (error: Exception) {
                     if (continuation.isActive) continuation.resumeWithException(error)
                 }
