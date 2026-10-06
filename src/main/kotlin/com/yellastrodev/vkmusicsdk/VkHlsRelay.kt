@@ -32,15 +32,20 @@ import okhttp3.Request
  * Loopback HLS для JVM/Android: переписывает URI и расшифровывает AES-128 сегменты.
  * JavaFX получает обычный HLS без EXT-X-KEY. Корни очереди могут получать URL лениво.
  * Медиа не перекодируется; необязательный кеш сохраняет готовые сегменты, без AES-ключей.
+ * Диагностика ответа показывает MIME и признаки контейнера без дампа медиаданных.
+ * Опциональный desktop-режим снимает TS/PES с MP3 перед HTTP-ответом; кеш/bundle сохраняют исходный plaintext.
  * Явная загрузка экспортирует полный локальный bundle, который новый relay открывает без сети.
  * Параллельные запросы объединяются; сброс попытки отменяет незавершённые HTTP и ожидания.
  * Нюансы sequence-IV, смены ключей и BYTERANGE сверены с vkpymusic/m3u8converter.py.
  */
 class VkHlsRelay internal constructor(
     private val fetchOverride: ((String, String?) -> ByteArray)?,
+    private val mp3HlsSegments: Boolean,
 ) : Closeable {
-    /** Создаёт relay с HTTPS-транспортом; fixture-транспорт используется только тестами. */
-    constructor() : this(null)
+    /** Создаёт HTTPS relay; JavaFX может запрашивать MP3-сегменты вместо MP3-в-TS. */
+    constructor(mp3HlsSegments: Boolean = false) : this(null, mp3HlsSegments)
+    /** Сохраняет прежний fixture-конструктор без преобразования сегментов. */
+    internal constructor(fetchOverride: (String, String?) -> ByteArray) : this(fetchOverride, false)
     private val server = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
     private val workers = Executors.newFixedThreadPool(4) { task ->
         Thread(task, "vk-hls-resource").apply { isDaemon = true }
@@ -67,7 +72,7 @@ class VkHlsRelay internal constructor(
         start()
     }
 
-    /** Ресурс HLS, опционально зашифрованный и ограниченный byte range. */
+    /** Исходный ресурс HLS и флаг снятия TS-обёртки только при отдаче desktop-плееру. */
     private data class Resource(
         val url: String,
         val playlist: Boolean = false,
@@ -80,6 +85,7 @@ class VkHlsRelay internal constructor(
         val cacheKey: String? = null,
         val localFile: File? = null,
         val savedAudio: (() -> File?)? = null,
+        val mp3Segment: Boolean = false,
     )
 
     /** Объединяет HEAD/GET одного открытия; при повторном запуске позже обновляет media URL. */
@@ -118,11 +124,12 @@ class VkHlsRelay internal constructor(
     /** Подключает постоянный кеш до регистрации корней; ошибки диска не прерывают воспроизведение. */
     fun useAudioCache(cache: VkAudioCache?) { audioCache = cache }
 
-    /** Открывает опубликованный локальный bundle через HTTP для одинакового HLS-поведения Android/JavaFX. */
+    /** Открывает bundle без изменения файлов; desktop получает MP3 вместо сохранённых TS-сегментов. */
     fun openSavedAudio(root: File): String {
         require(root.isFile && root.length() > 0)
         return register(Resource("", playlist = root.extension == "m3u8", localFile = root,
-            contentType = if (root.extension == "mp3") "audio/mpeg" else "video/mp2t"))
+            contentType = if (root.extension == "mp3") "audio/mpeg" else "video/mp2t",
+            mp3Segment = mp3HlsSegments && root.extension == "ts"))
     }
 
     /** Сохраняет конечный HLS-граф с plaintext-сегментами либо прямой файл; URL/ключи на диск не записываются. */
@@ -247,10 +254,10 @@ class VkHlsRelay internal constructor(
         finally { if (existing == null) pending.remove(key, task) }
     }
 
-    /** Даёт ресурсу непрозрачный адрес; подписанные upstream URL не попадают в плеер. */
+    /** Даёт непрозрачный адрес с расширением фактического ответа, нужным HLS-парсеру JavaFX. */
     private fun register(resource: Resource): String {
         check(!closed)
-        val path = "/${UUID.randomUUID()}${if (resource.playlist) ".m3u8" else if (resource.deferred != null) ".mp3" else ".ts"}"
+        val path = "/${UUID.randomUUID()}${if (resource.playlist) ".m3u8" else if (resource.deferred != null || resource.mp3Segment || resource.contentType == "audio/mpeg") ".mp3" else ".ts"}"
         resources[path] = resource
         return "http://127.0.0.1:${server.localPort}$path"
     }
@@ -281,7 +288,7 @@ class VkHlsRelay internal constructor(
         }
     }
 
-    /** Обслуживает GET/HEAD и логирует ожидание worker, этап, байты и время с момента принятия соединения. */
+    /** Обслуживает GET/HEAD; desktop-сегмент преобразуется после plaintext-кеша, до Range/Content-Length. */
     private fun serve(socket: Socket, acceptedAt: Long) {
         val requestId = requestCounter.incrementAndGet()
         val startedAt = acceptedAt
@@ -323,12 +330,18 @@ class VkHlsRelay internal constructor(
                     stage = if (resolved.playlist) "HLS-плейлист" else "аудио/кеш/расшифровка"
                     diagnostic("[serveVkHls] Запрос $requestId: метод=${request[0]}, ресурс=$stage, локальный=${resolved.localFile != null}")
                     val identity = "${resolved.audioId}:${resolved.localFile ?: resolved.url}:${resolved.range}:${resolved.keyUrl}:${resolved.iv?.joinToString(",")}"
-                    val bytes = sharedLoad("resource:${resolved.playlist}:$identity") {
+                    val originalBytes = sharedLoad("resource:${resolved.playlist}:$identity") {
                         if (resolved.playlist) playlists.getOrPut("${resolved.audioId}:${resolved.localFile ?: resolved.url}") {
                             resolved.localFile?.let(::rewriteSaved)
                                 ?: rewrite(resolved.url, fetch(resolved).toString(Charsets.UTF_8), resolved.audioId)
                         }.toByteArray(Charsets.UTF_8) else readMedia(resolved)
                     }
+                    val bytes = if (resolved.mp3Segment) {
+                        stage = "снятие TS-обёртки MP3"
+                        VkMpegTsMp3.extract(originalBytes).also {
+                            diagnostic("[prepareVkMp3] Запрос $requestId: исходныхБайт=${originalBytes.size}, MP3-байт=${it.size}")
+                        }
+                    } else originalBytes
                     ensureCurrentRequest()
                     stage = "отдача плееру"
                     val range = headers["range"]?.takeIf { !resolved.playlist }
@@ -336,11 +349,14 @@ class VkHlsRelay internal constructor(
                     val content = if (range != null) bytes.copyOfRange(range.first, range.last + 1) else bytes
                     val response = buildString {
                         append(if (range != null) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
-                        append("Content-Type: ${if (resolved.playlist) "application/vnd.apple.mpegurl" else resolved.contentType}\r\n")
+                        append("Content-Type: ${if (resolved.playlist) "application/vnd.apple.mpegurl" else if (resolved.mp3Segment) "audio/mpeg" else resolved.contentType}\r\n")
                         append("Content-Length: ${content.size}\r\nAccept-Ranges: bytes\r\n")
                         range?.let { append("Content-Range: bytes ${it.first}-${it.last}/${bytes.size}\r\n") }
                         append("Connection: close\r\n\r\n")
                     }
+                    diagnostic("[replyVkMedia] Запрос $requestId: HTTP=${if (range != null) 206 else 200}, " +
+                        "тип=${if (resolved.playlist) "HLS" else if (resolved.mp3Segment) "audio/mpeg" else resolved.contentType}, байт=${content.size}" +
+                        if (resolved.playlist) "" else ", ${mediaSignature(bytes)}")
                     output.write(response.toByteArray(Charsets.US_ASCII))
                     if (request[0] == "GET") output.write(content)
                     diagnostic("[serveVkHls] Запрос $requestId завершён: байт=${content.size}, время=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)}мс")
@@ -437,6 +453,16 @@ class VkHlsRelay internal constructor(
         return bytes
     }
 
+    /** Распознаёт контейнер по синхробайтам, не выводя содержимое аудио, ключей или медиассылку. */
+    private fun mediaSignature(bytes: ByteArray): String {
+        val ts = bytes.size >= 377 && listOf(0, 188, 376).all { (bytes[it].toInt() and 0xff) == 0x47 }
+        val adts = bytes.size >= 2 && (bytes[0].toInt() and 0xff) == 0xff && (bytes[1].toInt() and 0xf6) == 0xf0
+        val mp3 = bytes.size >= 4 && (bytes[0].toInt() and 0xff) == 0xff && (bytes[1].toInt() and 0xe6) == 0xe2
+        val id3 = bytes.size >= 3 && bytes[0] == 0x49.toByte() && bytes[1] == 0x44.toByte() && bytes[2] == 0x33.toByte()
+        val mp4 = bytes.size >= 8 && bytes.copyOfRange(4, 8).toString(Charsets.US_ASCII) in setOf("ftyp", "styp", "moof")
+        return "контейнер=${when { ts -> "MPEG-TS"; adts -> "ADTS"; mp3 -> "MP3"; id3 -> "ID3"; mp4 -> "MP4"; else -> "не распознан" }}, остаток188=${bytes.size % 188}"
+    }
+
     /** Расшифровывает AES-CBC с PKCS7; ключи остаются только в памяти relay. */
     private fun decodeMedia(resource: Resource): ByteArray {
         val bytes = fetch(resource)
@@ -453,7 +479,7 @@ class VkHlsRelay internal constructor(
         return decoded.copyOf(decoded.size - padding)
     }
 
-    /** Переписывает master/media playlist; убирает ключи и upstream BYTERANGE после обработки. */
+    /** Переписывает HLS; desktop-регистрация media-сегментов включает снятие TS/PES при HTTP-ответе. */
     internal fun rewrite(base: String, playlist: String, audioId: String? = null): String {
         require(playlist.trimStart().startsWith("#EXTM3U")) { "Некорректный HLS VK" }
         // Подпись в query меняется; пути, тайминги, IV и раскладка сегментов определяют версию аудио.
@@ -511,7 +537,8 @@ class VkHlsRelay internal constructor(
                         val iv = if (keyUrl == null) null else keyIv ?: ByteBuffer.allocate(16).putLong(0).putLong(sequence).array()
                         appendLine(register(Resource(url, nextIsPlaylist, upstreamRange(range, url, offsets), keyUrl, iv,
                             audioId = if (nextIsPlaylist) audioId else null,
-                            cacheKey = if (nextIsPlaylist) null else representation?.let { "$it:segment:${resourceIndex++}" })))
+                            cacheKey = if (nextIsPlaylist) null else representation?.let { "$it:segment:${resourceIndex++}" },
+                            mp3Segment = mp3HlsSegments && !nextIsPlaylist)))
                         if (!nextIsPlaylist) sequence++
                         nextIsPlaylist = false
                         range = null
