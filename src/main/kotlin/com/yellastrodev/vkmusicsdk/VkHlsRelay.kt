@@ -36,6 +36,7 @@ import okhttp3.Request
  * Опциональный desktop-режим снимает TS/PES с MP3 перед HTTP-ответом; кеш/bundle сохраняют исходный plaintext.
  * Явная загрузка экспортирует полный локальный bundle, который новый relay открывает без сети.
  * Параллельные запросы объединяются; сброс попытки отменяет незавершённые HTTP и ожидания.
+ * HLS-запрос и отсутствие данных ограничены 20с; общий бюджет затыка контролирует плеер.
  * Нюансы sequence-IV, смены ключей и BYTERANGE сверены с vkpymusic/m3u8converter.py.
  */
 class VkHlsRelay internal constructor(
@@ -51,7 +52,7 @@ class VkHlsRelay internal constructor(
         Thread(task, "vk-hls-resource").apply { isDaemon = true }
     }
     private val http = OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS).callTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS).callTimeout(20, TimeUnit.SECONDS)
         .eventListenerFactory { call -> NetworkEvents(call.request().tag(NetworkTrace::class.java)) }.build()
     private val resources = ConcurrentHashMap<String, Resource>()
     private val keys = ConcurrentHashMap<String, ByteArray>()
@@ -380,7 +381,7 @@ class VkHlsRelay internal constructor(
     private fun fetch(resource: Resource, kind: String = if (resource.playlist) "плейлист" else "аудио"): ByteArray =
         sharedLoad("network:${resource.url}:${resource.range}") { fetchNetwork(resource, kind) }
 
-    /** Логирует этап/байты: HLS ограничен 8с, полный прямой аудиофайл сохраняет прежний бюджет 25с. */
+    /** Логирует этап/байты: HLS ограничен 20с, полный прямой аудиофайл сохраняет бюджет 25с. */
     private fun fetchNetwork(resource: Resource, kind: String): ByteArray {
         ensureCurrentRequest()
         require(URI(resource.url).scheme == "https") { "Неподдерживаемая схема HLS" }
